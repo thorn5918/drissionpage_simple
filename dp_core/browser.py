@@ -20,6 +20,7 @@ from time import sleep
 
 from .driver import BrowserDriver, Driver, CDP_TIMEOUT
 from .errors import BrowserConnectError, JavaScriptError, PageDisconnectedError
+from .intercept import Interceptor
 from .launcher import check_connect, parse_address
 from .tools import is_js_func, raise_error
 
@@ -212,6 +213,7 @@ class Tab(object):
         self.browser = browser
         self.tab_id = tab_id
         self._driver = None
+        self._interceptor = None  # 网络请求拦截器，route()时懒创建
         self._created = True
 
     @property
@@ -235,6 +237,39 @@ class Tab(object):
     def on(self, event, callback):
         """注册页面级 CDP 事件回调，如 tab.on('Network.responseReceived', cb)"""
         self.driver.set_callback(event, callback)
+
+    # ---------------- 网络请求拦截 ----------------
+    def route(self, pattern, handler):
+        """注册网络请求拦截路由（对标 Playwright page.route）
+        :param pattern: 匹配模式，四种形式：
+            1. glob字符串：须匹配整个URL。'*'匹配除'/'外任意字符，'**'匹配任意字符，
+               '{a,b}'备选，如 '**/*.{png,jpg}'、'**/api/**'；'**'匹配所有请求
+            2. 编译后的正则：re.search语义
+            3. 函数：接收url字符串，返回bool
+        :param handler: 处理函数，接收Route对象，通过 route.continue_() / route.fulfill(...) /
+            route.abort() 处理请求；handler内抛出的异常会被打印，请求被放行
+        :return: self，可链式调用
+        示例：
+            tab.route('**/*.{png,jpg,woff2}', lambda r: r.abort())          # 阻断图片字体
+            tab.route('**/app.js', lambda r: r.fulfill(path='./app.js'))    # 本地文件替换
+            tab.route('**/api/user', lambda r: r.fulfill(body='{"id":1}',
+                                                content_type='application/json'))  # mock接口
+        """
+        if self._interceptor is None:
+            self._interceptor = Interceptor(self)
+        self._interceptor.route(pattern, handler)
+        return self
+
+    def unroute(self, pattern=None, handler=None):
+        """注销拦截路由
+        :param pattern: 只注销匹配该模式的路由；None为不限
+        :param handler: 只注销该处理函数；None为不限
+        两者都缺省时注销全部路由，并停止拦截
+        :return: self，可链式调用
+        """
+        if self._interceptor is not None:
+            self._interceptor.unroute(pattern, handler)
+        return self
 
     # ---------------- JS执行 ----------------
     def run_js(self, script, *args, as_expr=False, timeout=None):
@@ -343,6 +378,8 @@ class Tab(object):
     def _on_disconnect(self):
         """页面websocket断开（页面被关闭/跳转）时由Driver调用"""
         self._driver = None
+        if self._interceptor is not None:
+            self._interceptor._reset()
 
     def __repr__(self):
         return f'<Tab {self.tab_id}>'

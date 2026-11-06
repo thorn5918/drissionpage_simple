@@ -1,6 +1,6 @@
 # -*- coding:utf-8 -*-
 """
-dp_core 演示：连接调试端口 + 发送 CDP 命令 + 订阅 CDP 事件
+dp_core 演示：连接调试端口 + 发送 CDP 命令 + 订阅 CDP 事件 + 网络请求拦截
 
 用法（地址支持 'ip:port'、'http://ip:port/json/list'、int端口）：
     python demo.py http://123.168.144.158:20001/json/list
@@ -51,13 +51,28 @@ def main():
     print('1+2 ->', tab.run_js('function(a, b){return a + b}', 1, 2))
     print('UA(表达式) ->', tab.run_js('navigator.userAgent', as_expr=True))
 
-    # ---------- 5. 直接访问接口url并拿JSON ----------
+    # ---------- 5. 网络请求拦截：阻断静态资源 + mock接口 ----------
+    # 注：命中浏览器本地缓存的资源不经过网络栈，拦截不到；禁用缓存后演示更直观
+    tab.run_cdp('Network.enable')
+    tab.run_cdp('Network.setCacheDisabled', cacheDisabled=True)
+    blocked = []
+    tab.route('**/*.{png,jpg,jpeg,gif,webp,ico,woff,woff2}',
+              lambda r: (blocked.append(r.request.url), r.abort()))
+    tab.route('**/dp_demo_mock',
+              lambda r: r.fulfill(content_type='application/json', body='{"from": "local-mock"}'))
+    tab.get('https://www.baidu.com')
+    print(f'拦截：阻断了 {len(blocked)} 个静态资源请求')
+    tab.get('https://dp-mock.invalid/dp_demo_mock')
+    print('mock接口应答 ->', tab.json())
+    tab.unroute()
+
+    # ---------- 6. 直接访问接口url并拿JSON ----------
     data = tab.json('https://push2his.eastmoney.com/api/qt/stock/kline/get?cb=&secid=0.000001'
                     '&ut=fa5fd1943c7b386f172d6893dbfba10b&fields1=f1,f2,f3&fields2=f51,f52,f53'
                     '&klt=101&fqt=1&end=20500101&lmt=3')
     print('接口JSON ->', {k: data[k] for k in ('rc', 'rt') if k in data}, 'klines:', data.get('data', {}).get('klines'))
 
-    # ---------- 6. 清理：只关自己开的标签页，断开连接不关浏览器 ----------
+    # ---------- 7. 清理：只关自己开的标签页，断开连接不关浏览器 ----------
     tab.close()
     browser.disconnect()
     print('演示完成。')
