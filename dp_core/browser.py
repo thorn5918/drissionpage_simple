@@ -20,7 +20,7 @@ from time import sleep
 
 from .driver import BrowserDriver, Driver, CDP_TIMEOUT
 from .errors import BrowserConnectError, JavaScriptError, PageDisconnectedError
-from .intercept import Interceptor
+from .intercept import Interceptor, RouteRegistry
 from .launcher import check_connect, parse_address
 from .tools import is_js_func, raise_error
 
@@ -60,6 +60,8 @@ class Chromium(object):
         self._type = 'Chromium'
         self._tabs = {}  # {tab_id: targetInfo}，由目标事件维护
         self._newest_tab_id = None
+        self._page_tabs = {}  # {tab_id: Tab}，Tab对象池（get_tab/new_tab/自动挂接复用同一对象）
+        self._browser_routes = RouteRegistry()  # 浏览器级拦截路由（browser.route登记处）
 
         self._driver = BrowserDriver(self.id, 'browser', self.address, self)
         self.version = self.version_info.get('Browser', '')
@@ -101,6 +103,45 @@ class Chromium(object):
         """
         self._driver.set_callback(event, callback)
 
+    # ---------------- 网络请求拦截（浏览器级，对标 context.route） ----------------
+    def route(self, pattern, handler):
+        """注册浏览器级拦截路由：对本浏览器的所有页面生效
+        与 tab.route 的区别在于作用范围——包括已存在的标签页（含未经 dp_core 创建的）
+        和之后新开的标签页（无论由谁创建，通过目标事件自动挂接）。
+        同一请求同时命中页面级与浏览器级路由时，页面级优先（对标 Playwright）。
+        :param pattern: 匹配模式，同 tab.route（glob/正则/函数）
+        :param handler: 处理函数，接收Route对象
+        :return: self，可链式调用
+        """
+        if not callable(handler):
+            raise TypeError(f'handler必须是可调用对象，收到：{type(handler).__name__}')
+        self._browser_routes.add(pattern, handler)
+        for tab_id in list(self._tabs):  # 为所有现存页面挂接拦截器（幂等）
+            self._attach_interceptor(tab_id)
+        return self
+
+    def unroute(self, pattern=None, handler=None):
+        """注销浏览器级拦截路由；全部注销后，无本地路由的标签页停止拦截
+        :return: self，可链式调用
+        """
+        empty = self._browser_routes.remove(pattern, handler)
+        if empty:
+            for tab in list(self._page_tabs.values()):
+                if tab._interceptor is not None:
+                    tab._interceptor._on_browser_routes_changed()
+        return self
+
+    def _attach_interceptor(self, tab_id):
+        """为标签页挂上拦截器并确保拦截开启（幂等）；事件线程中调用，异常自行消化"""
+        try:
+            tab = self.get_tab(tab_id)
+            if tab._interceptor is None:
+                tab._interceptor = Interceptor(tab, browser_routes=self._browser_routes)
+            tab._interceptor._ensure_enabled()
+        except Exception:
+            from traceback import print_exc
+            print_exc()
+
     # ---------------- 标签页 ----------------
     @property
     def tabs(self):
@@ -128,7 +169,11 @@ class Chromium(object):
             id_or_num = self.tab_ids[id_or_num]
         elif id_or_num not in self.tab_ids:
             raise RuntimeError(f'未找到标签页：{id_or_num}，当前标签页：{self.tab_ids}')
-        return Tab(self, id_or_num)
+        tab = self._page_tabs.get(id_or_num)
+        if tab is None:
+            tab = Tab(self, id_or_num)
+            self._page_tabs[id_or_num] = tab
+        return tab
 
     def new_tab(self, url=None, new_window=False, background=False):
         """新建标签页并返回Tab对象
@@ -167,11 +212,18 @@ class Chromium(object):
     def _onTargetCreated(self, **kwargs):
         if (kwargs['targetInfo']['type'] in ('page', 'webview')
                 and not kwargs['targetInfo']['url'].startswith('devtools://')):
-            self._tabs[kwargs['targetInfo']['targetId']] = kwargs['targetInfo']
-            self._newest_tab_id = kwargs['targetInfo']['targetId']
+            tab_id = kwargs['targetInfo']['targetId']
+            self._tabs[tab_id] = kwargs['targetInfo']
+            self._newest_tab_id = tab_id
+            if len(self._browser_routes):  # 浏览器级路由生效中，自动挂接新标签页
+                self._attach_interceptor(tab_id)
 
     def _onTargetDestroyed(self, **kwargs):
-        self._tabs.pop(kwargs['targetId'], None)
+        tab_id = kwargs['targetId']
+        self._tabs.pop(tab_id, None)
+        tab = self._page_tabs.pop(tab_id, None)
+        if tab is not None and tab._driver is not None and tab._driver.is_running:
+            tab._driver.stop()  # 释放自动挂接的页面连接与线程
 
     def _on_disconnect(self):
         """websocket断开时由Driver调用"""
@@ -184,6 +236,10 @@ class Chromium(object):
         self.id, self.version_info = get_browser_id(self._address)
         self._driver = BrowserDriver(self.id, 'browser', self.address, self)
         self._tabs = {}
+        for tab in list(self._page_tabs.values()):  # 释放旧标签页连接，重连后自动重建
+            if tab._driver is not None and tab._driver.is_running:
+                tab._driver.stop()
+        self._page_tabs.clear()
         self._run_cdp('Target.setDiscoverTargets', discover=True)
         self._driver.set_callback('Target.targetCreated', self._onTargetCreated)
         self._driver.set_callback('Target.targetDestroyed', self._onTargetDestroyed)
@@ -191,6 +247,11 @@ class Chromium(object):
     # ---------------- 断开/退出 ----------------
     def disconnect(self):
         """只断开本程序的连接，浏览器保持运行"""
+        for tab in list(self._page_tabs.values()):  # 释放自动挂接/使用过的页面连接与线程
+            if tab._driver is not None and tab._driver.is_running:
+                tab._driver.stop()
+        self._page_tabs.clear()
+        self._browser_routes.clear()
         self._driver.stop()
         Chromium._BROWSERS.pop(self.id, None)
 
@@ -256,7 +317,7 @@ class Tab(object):
                                                 content_type='application/json'))  # mock接口
         """
         if self._interceptor is None:
-            self._interceptor = Interceptor(self)
+            self._interceptor = Interceptor(self, browser_routes=self.browser._browser_routes)
         self._interceptor.route(pattern, handler)
         return self
 

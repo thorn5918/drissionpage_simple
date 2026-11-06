@@ -1,6 +1,6 @@
 # -*- coding:utf-8 -*-
 """
-网络请求拦截（对标 Playwright page.route()，基于 CDP Fetch 域实现）
+网络请求拦截（对标 Playwright page.route() / context.route()，基于 CDP Fetch 域实现）
 
 原理（与 Playwright 在 Chromium 上的实现同构）：
 1. Fetch.enable 开启拦截后，命中模式的请求在网络栈处理前触发 Fetch.requestPaused 事件
@@ -11,9 +11,9 @@
 3. 未命中任何路由的请求立即放行，行为与未开启拦截时一致
 
 匹配语义与 Playwright 对齐：glob 模式（'*'不含'/'、'**'含'/'、'{a,b}'备选）须匹配整个URL；
-也支持正则（search语义）与接收url返回布尔的函数；多个路由命中时后注册的优先。
+也支持正则（search语义）与接收url返回布尔的函数；多条路由命中时后注册的优先；
+页面级（Tab.route）优先于浏览器级（Chromium.route），对标 Playwright 的 page/context 两级路由。
 """
-from base64 import b64encode
 from binascii import b2a_base64
 from functools import lru_cache
 from mimetypes import guess_type
@@ -23,7 +23,7 @@ from traceback import print_exc
 
 from .errors import CDPError, PageDisconnectedError
 
-__all__ = ['RequestInfo', 'Route', 'Interceptor', 'glob_to_regex']
+__all__ = ['RequestInfo', 'Route', 'RouteRegistry', 'Interceptor', 'glob_to_regex']
 
 # Fetch域开启参数：urlPattern统一用'*'（CDP的*跨'/'，放行所有请求），
 # 具体的Playwright语义匹配由Python侧完成，保证与Playwright行为一致
@@ -125,7 +125,8 @@ class Route(object):
         if self._done:
             return
         self._done = True
-        self._interceptor._pending.pop(self._id, None)
+        with self._interceptor._lock:
+            self._interceptor._pending.pop(self._id, None)
         try:
             # 连接已断时静默；其余错误（如非法参数）抛给上层打印
             self._interceptor._tab.run_cdp(method, requestId=self._id,
@@ -137,34 +138,31 @@ class Route(object):
             raise
 
 
-class Interceptor(object):
-    """标签页级拦截器：管理路由表与Fetch域生命周期，每个Tab一个"""
+class RouteRegistry(object):
+    """一组(pattern, handler)路由记录，线程安全，匹配时后注册优先"""
 
-    def __init__(self, tab):
-        self._tab = tab
-        self._routes = []  # [(pattern, handler)]，按注册顺序，匹配时倒序（后注册优先）
-        self._pending = {}  # {requestId: Route}，等待处理动作的请求
-        self._enabled = False  # Fetch域是否已启用
+    def __init__(self):
+        self._routes = []  # [(pattern, handler)]，按注册顺序
         self._lock = Lock()
 
-    # ---------------- 对Tab暴露的API ----------------
-    def route(self, pattern, handler):
-        """登记路由，首个路由时开启Fetch域"""
-        if not callable(handler):
-            raise TypeError(f'handler必须是可调用对象，收到：{type(handler).__name__}')
+    def __len__(self):
+        with self._lock:
+            return len(self._routes)
+
+    def add(self, pattern, handler):
+        """登记路由（相同记录只保留一条）
+        :return: 是否为登记后的第一条路由（用于判断是否需要开启拦截）
+        """
         entry = (pattern, handler)
         with self._lock:
-            if entry not in self._routes:  # 相同(pattern, handler)只保留一条
+            if entry not in self._routes:
                 self._routes.append(entry)
-            need_enable = not self._enabled
-            self._enabled = True
-        if need_enable:
-            # 先注册事件回调再enable，避免首个暂停事件漏接
-            self._tab.on('Fetch.requestPaused', self._on_request_paused)
-            self._tab.run_cdp('Fetch.enable', patterns=_FETCH_PATTERN)
+            return len(self._routes) == 1
 
-    def unroute(self, pattern=None, handler=None):
-        """注销路由；pattern与handler都缺省时注销全部。最后一条移除后关闭Fetch域"""
+    def remove(self, pattern=None, handler=None):
+        """注销路由；pattern与handler都缺省时清空
+        :return: 移除后是否已无路由
+        """
         with self._lock:
             if pattern is None and handler is None:
                 self._routes.clear()
@@ -172,25 +170,79 @@ class Interceptor(object):
                 self._routes = [(p, h) for p, h in self._routes
                                 if not ((pattern is None or _pattern_eq(p, pattern))
                                         and (handler is None or h == handler))]
-            empty = not self._routes
-        if empty and self._enabled:
+            return not self._routes
+
+    def clear(self):
+        with self._lock:
+            self._routes.clear()
+
+    def find_handler(self, url):
+        """返回第一个命中的处理器（倒序匹配，后注册优先），无命中返回None"""
+        with self._lock:
+            routes = self._routes[:]
+        return next((h for pattern, h in reversed(routes) if _match(pattern, url)), None)
+
+
+class Interceptor(object):
+    """标签页级拦截器：管理本Tab路由与Fetch域生命周期，每个Tab一个
+    :param browser_routes: 浏览器级路由表（Chromium.route登记处），本地路由未命中时兜底匹配，
+                          对标 Playwright "page路由优先于context路由" 的语义
+    """
+
+    def __init__(self, tab, browser_routes=None):
+        self._tab = tab
+        self._routes = RouteRegistry()  # Tab本地路由
+        self._browser_routes = browser_routes  # RouteRegistry 或 None
+        self._pending = {}  # {requestId: Route}，等待处理动作的请求
+        self._enabled = False  # Fetch域是否已启用
+        self._lock = Lock()
+
+    # ---------------- 对外API ----------------
+    def route(self, pattern, handler):
+        """登记本地路由，首个路由时开启Fetch域"""
+        if not callable(handler):
+            raise TypeError(f'handler必须是可调用对象，收到：{type(handler).__name__}')
+        first = self._routes.add(pattern, handler)
+        if first and not self._enabled:
+            self._enable()
+
+    def unroute(self, pattern=None, handler=None):
+        """注销本地路由；本地与浏览器级都无路由时关闭Fetch域"""
+        empty = self._routes.remove(pattern, handler)
+        if empty and not self._has_routes and self._enabled:
             self._stop()
+
+    def _on_browser_routes_changed(self):
+        """浏览器级路由清空后重新评估：本地也无路由则停止拦截"""
+        if self._enabled and not self._has_routes:
+            self._stop()
+
+    def _ensure_enabled(self):
+        """自动挂接用：存在任一级路由时确保Fetch域开启（幂等）"""
+        if not self._enabled and self._has_routes:
+            self._enable()
+
+    @property
+    def _has_routes(self):
+        return len(self._routes) > 0 or (self._browser_routes is not None
+                                         and len(self._browser_routes) > 0)
 
     # ---------------- 事件分发 ----------------
     def _on_request_paused(self, requestId, request, resourceType, **kwargs):
-        """Fetch.requestPaused事件入口：匹配路由分发，未匹配立即放行
+        """Fetch.requestPaused事件入口：页面级路由优先，其次浏览器级，未匹配立即放行
         任何异常都在此消化（打印堆栈+放行），保证Driver事件线程不被杀死
         """
         try:
-            with self._lock:
-                routes = self._routes[:]
-            handler = next((h for pattern, h in reversed(routes)
-                            if _match(pattern, request.get('url', ''))), None)
+            url = request.get('url', '')
+            handler = self._routes.find_handler(url)
+            if handler is None and self._browser_routes is not None:
+                handler = self._browser_routes.find_handler(url)
             if handler is None:
                 self._release(requestId)
                 return
             route = Route(requestId, request, resourceType, self)
-            self._pending[requestId] = route
+            with self._lock:
+                self._pending[requestId] = route
             handler(route)
         except Exception:
             print_exc()
@@ -200,36 +252,51 @@ class Interceptor(object):
                 pass
 
     # ---------------- 内部 ----------------
+    def _enable(self):
+        # 先注册事件回调再enable，避免首个暂停事件漏接
+        self._tab.on('Fetch.requestPaused', self._on_request_paused)
+        self._tab.run_cdp('Fetch.enable', patterns=_FETCH_PATTERN)
+        with self._lock:
+            self._enabled = True
+
     def _release(self, request_id):
         """放行一个暂停中的请求（尽力而为，连接/目标不存在时静默）"""
-        self._pending.pop(request_id, None)
+        with self._lock:
+            self._pending.pop(request_id, None)
         self._tab.run_cdp('Fetch.continueRequest', requestId=request_id,
                           _ignore=(CDPError, PageDisconnectedError))
 
     def _stop(self):
         """兜底放行仍在暂停中的请求，然后关闭Fetch域"""
-        for request_id in list(self._pending):
+        with self._lock:
+            pending_ids = list(self._pending)
+        for request_id in pending_ids:
             try:
                 self._release(request_id)
             except Exception:
                 pass
-        self._pending.clear()
+        with self._lock:
+            self._pending.clear()
         try:
             self._tab.run_cdp('Fetch.disable', _ignore=(CDPError, PageDisconnectedError))
         except Exception:
             pass
         self._tab.on('Fetch.requestPaused', None)
-        self._enabled = False
+        with self._lock:
+            self._enabled = False
 
     def _reset(self):
-        """连接断开时清空全部状态（不发送任何CDP命令），重连后可重新注册"""
+        """连接断开时清空本地状态（不发送任何CDP命令），重连后可重新注册；
+        浏览器级路由表由Chromium持有，重连后随自动挂接恢复生效"""
+        self._routes.clear()
         with self._lock:
-            self._routes.clear()
             self._pending.clear()
             self._enabled = False
 
     def __repr__(self):
-        return f'<Interceptor {len(self._routes)} routes, {len(self._pending)} pending>'
+        return (f'<Interceptor {len(self._routes)} local, '
+                f'{len(self._browser_routes) if self._browser_routes else 0} browser, '
+                f'{len(self._pending)} pending>')
 
 
 # ---------------- 模式匹配 ----------------

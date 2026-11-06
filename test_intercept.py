@@ -195,6 +195,50 @@ def test_abort_and_unroute(tab):
     print('[ok] abort/unroute：阻断资源→全部阻断→unroute恢复，三阶段行为正确')
 
 
+def test_browser_route(browser):
+    """浏览器级路由：全部页面生效（含未经new_tab创建的裸标签页），页面级优先，unroute恢复"""
+    path, cleanup = _make_local_html()
+    created = []
+    try:
+        # 常规标签页（dp_core创建）
+        t1 = browser.new_tab()
+        created.append(t1)
+        # 裸标签页（直接Target.createTarget，模拟用户手动打开，未经dp_core的new_tab）
+        raw_id = browser.run_cdp('Target.createTarget', url='about:blank')['targetId']
+        created.append(raw_id)
+
+        browser.route('**/dp_br_*.html', lambda r: r.fulfill(path=path))
+        assert len(browser._browser_routes) == 1
+
+        # dp_core创建的标签页被拦截
+        assert t1.get('https://dp-mock.invalid/dp_br_a.html', timeout=15)
+        assert t1.title == 'dp_local_ok', t1.title
+
+        # 裸标签页（自动挂接）同样被拦截
+        t2 = browser.get_tab(raw_id)
+        assert t2.get('https://dp-mock.invalid/dp_br_b.html', timeout=15)
+        assert t2.title == 'dp_local_ok', t2.title
+
+        # 页面级路由优先于浏览器级（对标Playwright）
+        t2.route('**/dp_br_b.html', lambda r: r.fulfill(body='page-level'))
+        assert t2.get('https://dp-mock.invalid/dp_br_b.html', timeout=15)
+        assert t2.run_js('return document.body.innerText') == 'page-level'
+        t2.unroute()
+        # 注销页面级后回到浏览器级
+        assert t2.get('https://dp-mock.invalid/dp_br_b.html', timeout=15)
+        assert t2.title == 'dp_local_ok', t2.title
+
+        # 浏览器级unroute后回到真实网络（DNS错误页）
+        browser.unroute()
+        assert t2.get('https://dp-mock.invalid/dp_br_c.html', timeout=8)
+        assert t2.title != 'dp_local_ok', 'unroute后应回到真实网络'
+    finally:
+        browser.unroute()
+        cleanup()
+        browser.close_tab(created)
+    print('[ok] 浏览器级路由：全部页面生效（含裸标签页），页面级优先，unroute恢复')
+
+
 def test_full_flow(addr):
     browser = Chromium(addr)
     tab = browser.new_tab()
@@ -207,6 +251,7 @@ def test_full_flow(addr):
         test_continue_modify_headers(tab)
         test_handler_exception(tab)
         test_abort_and_unroute(tab)
+        test_browser_route(browser)
     finally:
         tab.close()
     print('\n全部通过。')

@@ -17,9 +17,9 @@ dp_core —— 从 DrissionPage (https://gitee.com/g1879/DrissionPage) 抽取的
 from .browser import Chromium, Tab, get_browser_id, parse_address
 from .driver import Driver, BrowserDriver, CDP_TIMEOUT
 from .errors import BrowserConnectError, CDPError, JavaScriptError, PageDisconnectedError
-from .intercept import Interceptor, RequestInfo, Route, glob_to_regex
+from .intercept import Interceptor, RequestInfo, Route, RouteRegistry, glob_to_regex
 
 __all__ = ['Chromium', 'Tab', 'parse_address', 'get_browser_id', 'Driver', 'BrowserDriver',
            'BrowserConnectError', 'CDPError', 'JavaScriptError', 'PageDisconnectedError',
-           'CDP_TIMEOUT', 'Route', 'RequestInfo', 'Interceptor', 'glob_to_regex']
-__version__ = '0.3.0'
+           'CDP_TIMEOUT', 'Route', 'RequestInfo', 'RouteRegistry', 'Interceptor', 'glob_to_regex']
+__version__ = '0.4.0'

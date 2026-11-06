@@ -77,6 +77,10 @@ def add_header(r):
 tab.route('**/api/**', add_header)
 tab.unroute('**/api/**')                                      # 注销单条；unroute()注销全部
 
+# 浏览器级路由（对标 Playwright context.route）：对本浏览器所有页面生效
+browser.route('**/*.{png,jpg,woff2}', lambda r: r.abort())    # 含已存在和之后新开的标签页
+browser.unroute()
+
 # 断开连接（浏览器保持运行）；browser.quit() 才会关闭远端浏览器
 browser.disconnect()
 ```
@@ -94,11 +98,14 @@ python test_dp_core.py http://123.168.144.158:20001/json/list
 python test_intercept.py http://123.168.144.158:20001/json/list
 ```
 
-## 网络请求拦截说明（tab.route）
+## 网络请求拦截说明（tab.route / browser.route）
 
 - **原理**：与 Playwright 在 Chromium 上的实现同构——`Fetch.enable` 开启拦截，
   命中模式的请求在网络栈处理前触发 `Fetch.requestPaused`，处理器通过
   `route.continue_()` / `route.fulfill(...)` / `route.abort()` 三选一处理。
+- **两级路由**：`tab.route()` 只作用于单个标签页；`browser.route()` 对本浏览器
+  **所有页面**生效（含已存在和之后新开的标签页，无论由谁创建，对标 Playwright 的
+  `context.route()`）。同一请求同时命中时页面级优先。
 - **匹配语义**：glob 须匹配整个 URL（`*` 不跨 `/`、`**` 跨 `/`、`{a,b}` 备选、
   `?` 仅匹配字面问号）；也支持编译后的正则（`re.search` 语义）与
   接收 url 返回 bool 的函数；多条路由命中时**后注册的优先**。
@@ -109,7 +116,6 @@ python test_intercept.py http://123.168.144.158:20001/json/list
 - **与 Playwright 的已知差异**：
   - 重定向的每一跳都会触发一次处理器（Playwright 视为一次）；
   - 未实现 `route.fetch()`（先取真实响应再改写）与 `route.fallback()`（多路由链式）；
-  - 拦截范围为单个标签页（Playwright 可在 context 级对全部页面生效）；
   - 同 Playwright：Cookie/Host 等由网络栈后补的请求头不可见、不可改写，
     Service Worker 接管的请求不经过拦截。
 
