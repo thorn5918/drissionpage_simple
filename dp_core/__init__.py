@@ -15,11 +15,12 @@ dp_core —— 从 DrissionPage (https://gitee.com/g1879/DrissionPage) 抽取的
     dp_core/errors.py   <- DrissionPage/errors.py            （异常类型）
 """
 from .browser import Chromium, Tab, get_browser_id, parse_address
+from .collect import F
 from .driver import Driver, BrowserDriver, CDP_TIMEOUT
 from .errors import BrowserConnectError, CDPError, JavaScriptError, PageDisconnectedError
 from .intercept import Interceptor, RequestInfo, Route, RouteRegistry, glob_to_regex
 
-__all__ = ['Chromium', 'Tab', 'parse_address', 'get_browser_id', 'Driver', 'BrowserDriver',
+__all__ = ['Chromium', 'Tab', 'F', 'parse_address', 'get_browser_id', 'Driver', 'BrowserDriver',
            'BrowserConnectError', 'CDPError', 'JavaScriptError', 'PageDisconnectedError',
            'CDP_TIMEOUT', 'Route', 'RequestInfo', 'RouteRegistry', 'Interceptor', 'glob_to_regex']
-__version__ = '0.4.0'
+__version__ = '0.5.0'

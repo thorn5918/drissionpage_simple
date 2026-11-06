@@ -19,6 +19,7 @@
 | `dp_core/launcher.py` | `_functions/browser.py` | 调试端口连接/校验（`parse_address`/`check_connect`） |
 | `dp_core/browser.py` | `_base/chromium.py` + `_pages/chromium_base.py` | `Chromium` 浏览器对象与 `Tab` 标签页对象 |
 | `dp_core/intercept.py` | 参照 [Playwright page.route](https://playwright.dev/python/docs/network) 实现 | 网络请求拦截（`tab.route`/`Route`），基于 CDP Fetch 域 |
+| `dp_core/collect.py` | 新增（run_js 封装） | 批量采集（`tab.collect`/`F`）：单次通讯取回列表数据 + Python 侧声明式后处理 |
 | `dp_core/tools.py` | `_functions/tools.py` | `port_is_using`、`raise_error` 等工具 |
 | `dp_core/errors.py` | `errors.py` | `BrowserConnectError`/`CDPError`/`PageDisconnectedError` |
 
@@ -81,6 +82,19 @@ tab.unroute('**/api/**')                                      # 注销单条；u
 browser.route('**/*.{png,jpg,woff2}', lambda r: r.abort())    # 含已存在和之后新开的标签页
 browser.unroute()
 
+# 批量采集：单次通讯取回整个列表，后处理在Python侧声明式完成
+from dp_core import F
+data = tab.collect('#content_left .result', {
+    'title': F('h3 a').text,                              # 文本，默认去空白+连续空格合一
+    'url':   F('h3 a').attr('href').prefix('https:'),     # 属性+加前缀
+    'time':  F('.c-gray').text.re(r'(\d{4}-\d{2}-\d{2})'),  # 正则提取
+    'tags':  F('.tag', all=True).text.join(','),          # item内多个标签拼接
+    'total': F.global_('#page').text.int().default(1),    # 全页面字段（不属于单个item）
+})
+# 取值方式：.text / .text_raw / .html / .outer / .attr(名) / .prop(名)
+# 后处理：strip collapse remove_blank replace re prefix suffix default int float map join
+# 元素缺失或正则无匹配→None；记录顺序与DOM一致；取数只产生一次CDP通讯
+
 # 断开连接（浏览器保持运行）；browser.quit() 才会关闭远端浏览器
 browser.disconnect()
 ```
@@ -96,6 +110,9 @@ python test_dp_core.py http://123.168.144.158:20001/json/list
 
 # 自测：拦截（glob匹配单测 + fulfill/abort/continue/异常兜底集成测试）
 python test_intercept.py http://123.168.144.158:20001/json/list
+
+# 自测：批量采集（F构建/处理器管道单测 + 真实浏览器采集集成测试）
+python test_collect.py http://123.168.144.158:20001/json/list
 ```
 
 ## 网络请求拦截说明（tab.route / browser.route）

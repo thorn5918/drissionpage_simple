@@ -18,6 +18,7 @@ from pathlib import Path
 from threading import Lock
 from time import sleep
 
+from .collect import collect as _collect
 from .driver import BrowserDriver, Driver, CDP_TIMEOUT
 from .errors import BrowserConnectError, JavaScriptError, PageDisconnectedError
 from .intercept import Interceptor, RouteRegistry
@@ -389,6 +390,26 @@ class Tab(object):
                              objectId=result['objectId'], returnByValue=True, userGesture=True)
             return loads(r['result']['value'])
         return result.get('value')
+
+    # ---------------- 批量采集 ----------------
+    def collect(self, items, fields, timeout=None):
+        """批量采集：单次通讯取回整个列表数据，后处理在Python侧声明式完成
+        :param items: 数据项选择器，如 '.result-op'
+        :param fields: {字段名: F对象或配置dict}，声明每个字段的取值与后处理
+        :param timeout: 取数超时秒数
+        :return: list[dict]，记录顺序与DOM文档顺序一致
+        用法：
+            from dp_core import F
+            data = tab.collect('#content_left .result-op', {
+                'title': F('h3 a').text,                       # 文本，默认清理空白
+                'url':   F('h3 a').attr('href').prefix('https:'),
+                'time':  F('.c-gray').text.re(r'(\d{4}-\d{2}-\d{2})'),
+                'tags':  F('.tag', all=True).text.join(','),   # 多个标签拼接
+                'total': F.global_('.page-total').text.int(),  # 全页面字段
+            })
+        字段声明等价的dict形态：{'sel': 'h3 a', 'get': 'attr:href', 'steps': [...]}
+        """
+        return _collect(self, items, fields, timeout=timeout)
 
     # ---------------- JSON接口 ----------------
     def json(self, url=None, timeout=30):
