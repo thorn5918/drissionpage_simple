@@ -68,7 +68,7 @@ class Driver(object):
                 self.method_results.pop(ws_id, None)
                 return {'id': ws_id, 'result': {}}
 
-        except (OSError, WebSocketConnectionClosedException):
+        except (OSError, WebSocketConnectionClosedException, WebSocketTimeoutException):
             self.method_results.pop(ws_id, None)
             return {'error': {'message': 'connection disconnected'}, 'type': 'connection_error'}
 
@@ -146,7 +146,9 @@ class Driver(object):
     def start(self):
         self.is_running = True
         try:
-            self._ws = create_connection(self._websocket_url, enable_multithread=True, suppress_origin=True)
+            # 带连接超时：避免目标异常时无限阻塞调用方（事件线程挂接场景尤其重要）
+            self._ws = create_connection(self._websocket_url, timeout=10,
+                                         enable_multithread=True, suppress_origin=True)
         except WebSocketBadStatusException as e:
             if 'Handshake status 403 Forbidden' in str(e):
                 raise EnvironmentError('websocket-client版本过低，请升级：pip install -U websocket-client')

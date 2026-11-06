@@ -116,8 +116,9 @@ class Chromium(object):
         if not callable(handler):
             raise TypeError(f'handler必须是可调用对象，收到：{type(handler).__name__}')
         self._browser_routes.add(pattern, handler)
-        for tab_id in list(self._tabs):  # 为所有现存页面挂接拦截器（幂等）
-            self._attach_interceptor(tab_id)
+        # 用HTTP接口的存量标签页清单挂接（与目标事件的到达时序无关，route()后立即生效）
+        for info in self.tabs:
+            self._attach_interceptor(info['id'])
         return self
 
     def unroute(self, pattern=None, handler=None):
@@ -132,9 +133,13 @@ class Chromium(object):
         return self
 
     def _attach_interceptor(self, tab_id):
-        """为标签页挂上拦截器并确保拦截开启（幂等）；事件线程中调用，异常自行消化"""
+        """为标签页挂上拦截器并确保拦截开启（幂等）；事件线程中调用，异常自行消化。
+        直接进Tab对象池，避免get_tab的HTTP校验阻塞事件线程"""
         try:
-            tab = self.get_tab(tab_id)
+            tab = self._page_tabs.get(tab_id)
+            if tab is None:
+                tab = Tab(self, tab_id)
+                self._page_tabs[tab_id] = tab
             if tab._interceptor is None:
                 tab._interceptor = Interceptor(tab, browser_routes=self._browser_routes)
             tab._interceptor._ensure_enabled()
@@ -173,6 +178,8 @@ class Chromium(object):
         if tab is None:
             tab = Tab(self, id_or_num)
             self._page_tabs[id_or_num] = tab
+        if len(self._browser_routes):  # 浏览器级路由生效中，确保本页拦截已挂接
+            self._attach_interceptor(id_or_num)
         return tab
 
     def new_tab(self, url=None, new_window=False, background=False):
@@ -274,15 +281,17 @@ class Tab(object):
         self.browser = browser
         self.tab_id = tab_id
         self._driver = None
+        self._driver_lock = Lock()  # 保护懒加载，避免并发创建两条页面连接
         self._interceptor = None  # 网络请求拦截器，route()时懒创建
         self._created = True
 
     @property
     def driver(self) -> Driver:
-        """页面级驱动（懒建立）"""
-        if self._driver is None or not self._driver.is_running:
-            self._driver = Driver(self.tab_id, 'page', self.browser.address, owner=self)
-        return self._driver
+        """页面级驱动（懒建立，并发安全）"""
+        with self._driver_lock:
+            if self._driver is None or not self._driver.is_running:
+                self._driver = Driver(self.tab_id, 'page', self.browser.address, owner=self)
+            return self._driver
 
     # ---------------- CDP ----------------
     def run_cdp(self, cmd, **cmd_args):
