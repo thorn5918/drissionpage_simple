@@ -1,0 +1,16 @@
+# 平台运行时文件，不属于项目
+opencode
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 内部协作笔记（含调试环境信息）
+.monkeycode/
+
+# 系统文件
+.DS_Store
+Thumbs.db
